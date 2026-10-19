@@ -4,6 +4,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from zoneinfo import ZoneInfo
+from astropy.time import Time
+import json
+import urllib.request
+import time
+import io
+
 
 def gauss_fit(x,y, verbose=False, plot=False):
     '''
@@ -42,6 +49,13 @@ def gauss_fit(x,y, verbose=False, plot=False):
     fwhm = 2.35482 * abs(sigma_fit)
     
     if verbose:
+        jd_value = x0_fit
+        t_utc = Time(jd_value, format="jd", scale="utc")
+        t_hk = t_utc.to_datetime(timezone=ZoneInfo("Asia/Hong_Kong"))
+        
+        print("###### TIME INFO #######")
+        print("UTC Time:      ", t_utc.iso)
+        print("Hong Kong Time:", t_hk.strftime("%Y-%m-%d %H:%M:%S %Z"))
         print('### Gaussian Fit ###')
         print('Amplitude',A_fit)
         print('Centre [Julian date]',x0_fit)
@@ -104,3 +118,111 @@ def get_beam_angle(times_jd,counts_adu):
     speed_sun = get_apparent_speed_sun(centre_jd)
     FWHM_deg =  FWHM_min * speed_sun
     return FWHM_deg
+
+
+def print_time_peak(time,flux,timezone="HKT"):
+    '''Give the time in Julian date and the flux in any units and 
+    you will get back the exact time of the peak. 
+    You can choose the format to be timezone="UTC","HKT", "JD" '''
+    # Find Julian Date of the peak
+    jd_value = time[np.argmax(flux)]
+    # Parse the Julian Date into an Astropy Time object (in UTC)
+    t_utc = Time(jd_value, format="jd", scale="utc")
+    # Convert to a Python datetime object with Hong Kong Time zone
+    t_hk = t_utc.to_datetime(timezone=ZoneInfo("Asia/Hong_Kong"))
+    if timezone=="UTC":
+        print("UTC Time:      ", t_utc.iso)
+        return t_utc.iso
+    elif timezone=="HKT":
+        print("Hong Kong Time:", t_hk.strftime("%Y-%m-%d %H:%M:%S %Z"))
+        return t_hk.strftime("%Y-%m-%d %H:%M:%S %Z")
+    elif timezone=="JD":
+        print("Julian Time:   ",jd_value)
+        return jd_value
+    else:
+        print("Choose a timezone between UTC, HKT or JD.")
+        return np.nan
+    
+def get_solar_flux_on_date(yymmdd,verbose=False):
+    import pandas as pd
+    import requests
+
+    # 1. Define date (Learmonth files use YYMMDD format, e.g., '240724' for July 24, 2024)
+    # Note: Learmonth archives daily files formatted as L<YYMMDD>.SRD
+
+    date_str = str(yymmdd)
+
+
+    url = f"https://sws.bom.gov.au/Category/World%20Data%20Centre/Data%20Display%20and%20Download/Solar%20Radio/station/learmonth/SRD/2026/L{date_str}.SRD"
+
+    # 2. Fetch file directly from Australian BOM FTP/HTTP mirror
+    response = requests.get(url)
+
+    if response.status_code == 200:
+        # Column names corresponding to the 8 frequencies in Learmonth SRD format
+        col_names = [
+            "time_ut",
+            "f_245MHz",
+            "f_410MHz",
+            "f_610MHz",
+            "flux_1_4GHz",  # 1415 MHz channel
+            "f_2695MHz",
+            "f_4975MHz",
+            "f_8800MHz",
+            "f_15400MHz",
+        ]
+
+        # Read space-separated values, treating '//////' or non-numeric entries as NaN
+        df = pd.read_csv(
+            io.StringIO(response.text),
+            sep=r"\s+",
+            names=col_names,
+            na_values=["//////", "------"],
+            on_bad_lines="skip",
+        )
+
+        # Convert HHMMSS string column into proper timestamp format
+        date_prefix = f"20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}"
+        df["time_ut_clean"] = df["time_ut"].astype(str).str.zfill(6)
+        df["datetime"] = pd.to_datetime(
+            date_prefix + " " + df["time_ut_clean"],
+            format="%Y-%m-%d %H%M%S",
+            errors="coerce",
+        )
+
+        # Filter out any rows with invalid timestamps or missing 1.4GHz flux
+        df_clean = df.dropna(subset=["datetime", "flux_1_4GHz"]).copy()
+    
+        # 1. Daytime Average (Filters out nighttime zero/near-zero values)
+        daytime_data = df_clean[df_clean["flux_1_4GHz"] > 10]
+        daytime_avg = daytime_data["flux_1_4GHz"].mean()
+
+        # 2. Raw 24-Hour Average (All records)
+        raw_avg = df_clean["flux_1_4GHz"].mean()
+        
+        if verbose:
+            print(f"Daytime Solar Average (1.4 GHz): {daytime_avg:.2f} SFU")
+            print(f"Raw 24-Hour Average (1.4 GHz):   {raw_avg:.2f} SFU")
+            print("\n")
+
+        return daytime_avg
+    
+def get_conversion_K(julian_dates, counts_adu, amp_adu, solar_flux_sfu, aperture_eff=0.60):
+    k_B = 1.38e-23  # Boltzmann constant [J/K]
+    dish_diameter = 3.0  # Dish diameter in meters
+
+
+    # Calculate Effective Aperture
+    A_geom = np.pi * (dish_diameter / 2) ** 2
+    A_e = aperture_eff * A_geom
+
+    # Convert SFU to W/m^2/Hz
+    S_flux = solar_flux_sfu * 1e-22
+
+    # Expected Antenna Temperature of the Sun
+    T_sun_expected = (S_flux * A_e) / (2 * k_B)
+
+    # Calculate Calibration Factor K
+    K = T_sun_expected / amp_adu
+
+    return K
